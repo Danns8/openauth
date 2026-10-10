@@ -186,18 +186,17 @@ export type Prettify<T> = {
 } & {}
 
 import {
-  MissingParameterError,
   OauthError,
-  UnauthorizedClientError,
   UnknownStateError,
 } from "./error.js"
 import { compactDecrypt, CompactEncrypt, jwtVerify, SignJWT } from "jose"
 import { Storage, StorageAdapter } from "./storage/storage.js"
 import { encryptionKeys, legacySigningKeys, signingKeys } from "./keys.js"
-import { validatePKCE } from "./pkce.js"
+import { isPKCEChallenge, validatePKCE } from "./pkce.js"
+import { issuerOrigin, isSafeRedirectURI, registeredRedirects, stateCookie, readStateCookie, type RegisteredClients } from "./security.js"
 import { Select } from "./ui/select.js"
 import { setTheme, Theme } from "./ui/theme.js"
-import { getRelativeUrl, isDomainMatch, lazy } from "./util.js"
+import { getRelativeUrl, lazy } from "./util.js"
 import { DynamoStorage } from "./storage/dynamo.js"
 import { MemoryStorage } from "./storage/memory.js"
 import { cors } from "hono/cors"
@@ -251,6 +250,10 @@ export interface IssuerInput<
    * ```
    */
   storage?: StorageAdapter
+  /** Fixed public origin. Required when the request URL is an internal proxy URL. */
+  issuer?: string
+  /** Exact redirect URI registrations. Unknown clients are denied by default. */
+  clients?: RegisteredClients
   /**
    * The providers that you want your OpenAuth server to support.
    *
@@ -410,23 +413,11 @@ export interface IssuerInput<
    */
   error?(error: UnknownStateError, req: Request): Promise<Response>
   /**
-   * Override the logic for whether a client request is allowed to call the issuer.
-   *
-   * By default, it uses the following:
-   *
-   * - Allow if the `redirectURI` is localhost.
-   * - Compare `redirectURI` to the request's hostname or the `x-forwarded-host` header. If they
-   *   are from the same sub-domain level, then allow.
-   *
-   * @example
-   * ```ts
-   * {
-   *   allow: async (input, req) => {
-   *     // Allow all clients
-   *     return true
-   *   }
-   * }
-   * ```
+   * Additional authorization policy. When `clients` is provided, this callback
+   * cannot override its exact redirect URI registrations. Without `clients`, this
+   * callback MUST validate both the client ID and its full registered redirect URI.
+   * With neither option configured, authorization requests are denied.
+   * The callback must be safe to call again when completing an authorization.
    */
   allow?(
     input: {
@@ -471,22 +462,20 @@ export function issuer<
   }
 
   const select = lazy(() => input.select ?? Select())
-  const allow = lazy(
-    () =>
-      input.allow ??
-      (async (input: any, req: Request) => {
-        const redir = new URL(input.redirectURI).hostname
-        if (redir === "localhost" || redir === "127.0.0.1") {
-          return true
-        }
-        const forwarded = req.headers.get("x-forwarded-host")
-        const host = forwarded
-          ? new URL(`https://${forwarded}`).hostname
-          : new URL(req.url).hostname
-
-        return isDomainMatch(redir, host)
-      }),
-  )
+  const configuredIssuer = input.issuer !== undefined ? issuerOrigin(input.issuer) : undefined
+  const registered = registeredRedirects(input.clients)
+  async function allowAuthorization(value: AuthorizationState, req: Request) {
+    if (!isSafeRedirectURI(value.redirect_uri)) return false
+    if (input.clients && !registered(value.client_id, value.redirect_uri)) return false
+    if (input.allow) {
+      return input.allow({
+        clientID: value.client_id,
+        redirectURI: value.redirect_uri,
+        audience: value.audience,
+      }, req)
+    }
+    return registered(value.client_id, value.redirect_uri)
+  }
 
   let storage = input.storage
   if (process.env.OPENAUTH_STORAGE) {
@@ -508,8 +497,8 @@ export function issuer<
     ),
   )
   const allEncryption = lazy(() => encryptionKeys(storage))
-  const signingKey = lazy(() => allSigning().then((all) => all[0]))
-  const encryptionKey = lazy(() => allEncryption().then((all) => all[0]))
+  const signingKey = lazy(() => allSigning().then((all) => all.find((key) => !key.expired)!))
+  const encryptionKey = lazy(() => allEncryption().then((all) => all.find((key) => !key.expired)!))
 
   const auth: Omit<ProviderOptions<any>, "name"> = {
     async success(ctx: Context, properties: any, successOpts) {
@@ -520,29 +509,7 @@ export function issuer<
             const subject = subjectOpts?.subject
               ? subjectOpts.subject
               : await resolveSubject(type, properties)
-            await successOpts?.invalidate?.(
-              await resolveSubject(type, properties),
-            )
-            if (authorization.response_type === "token") {
-              const location = new URL(authorization.redirect_uri)
-              const tokens = await generateTokens(ctx, {
-                subject,
-                type: type as string,
-                properties,
-                clientID: authorization.client_id,
-                ttl: {
-                  access: subjectOpts?.ttl?.access ?? ttlAccess,
-                  refresh: subjectOpts?.ttl?.refresh ?? ttlRefresh,
-                },
-              })
-              location.hash = new URLSearchParams({
-                access_token: tokens.access,
-                refresh_token: tokens.refresh,
-                state: authorization.state || "",
-              }).toString()
-              await auth.unset(ctx, "authorization")
-              return ctx.redirect(location.toString(), 302)
-            }
+            await successOpts?.invalidate?.(subject)
             if (authorization.response_type === "code") {
               const code = crypto.randomUUID()
               await Storage.set(
@@ -555,6 +522,7 @@ export function issuer<
                   redirectURI: authorization.redirect_uri,
                   clientID: authorization.client_id,
                   pkce: authorization.pkce,
+                  expiresAt: Date.now() + 60 * 1000,
                   ttl: {
                     access: subjectOpts?.ttl?.access ?? ttlAccess,
                     refresh: subjectOpts?.ttl?.refresh ?? ttlRefresh,
@@ -589,23 +557,29 @@ export function issuer<
       )
     },
     async set(ctx, key, maxAge, value) {
-      setCookie(ctx, key, await encrypt(value), {
+      const name = cookieName(ctx, key)
+      setCookie(ctx, name, await encrypt(stateCookie(name, maxAge, value)), {
         maxAge,
+        path: "/",
         httpOnly: true,
-        ...(ctx.req.url.startsWith("https://")
-          ? { secure: true, sameSite: "None" }
-          : {}),
+        ...(getRelativeUrl(ctx, "/").startsWith("https://")
+          ? { secure: true, sameSite: "None" as const }
+          : { sameSite: "Lax" as const }),
       })
     },
     async get(ctx: Context, key: string) {
-      const raw = getCookie(ctx, key)
+      const name = cookieName(ctx, key)
+      const raw = getCookie(ctx, name)
       if (!raw) return
-      return decrypt(raw).catch((ex) => {
-        console.error("failed to decrypt", key, ex)
-      })
+      try {
+        return readStateCookie<any>(await decrypt(raw), name)
+      } catch {
+        // Invalid or old-format cookies are not authorization credentials.
+        return undefined
+      }
     },
     async unset(ctx: Context, key: string) {
-      deleteCookie(ctx, key)
+      deleteCookie(ctx, cookieName(ctx, key), { path: "/" })
     },
     async invalidate(subject: string) {
       // Resolve the scan in case modifications interfere with iteration
@@ -619,11 +593,23 @@ export function issuer<
     storage,
   }
 
-  async function getAuthorization(ctx: Context) {
-    const match =
-      (await auth.get(ctx, "authorization")) || ctx.get("authorization")
-    if (!match) throw new UnknownStateError()
-    return match as AuthorizationState
+  function cookieName(ctx: Context, key: string) {
+    if (key !== "provider") return key
+    const provider = ctx.get("provider") as string | undefined
+    if (!provider || !/^[A-Za-z0-9_-]+$/.test(provider)) throw new UnknownStateError()
+    return `provider_${provider}`
+  }
+
+  async function getAuthorization(ctx: Context): Promise<AuthorizationState> {
+    const match = ctx.get("authorization") || await auth.get(ctx, "authorization")
+    if (
+      !match || match.response_type !== "code" ||
+      typeof match.client_id !== "string" || !match.client_id ||
+      typeof match.state !== "string" ||
+      !isPKCEChallenge(match.pkce?.challenge, match.pkce?.method) ||
+      !(await allowAuthorization(match, ctx.req.raw))
+    ) throw new UnknownStateError()
+    return match
   }
 
   async function encrypt(value: any) {
@@ -728,10 +714,21 @@ export function issuer<
   const app = new Hono<{
     Variables: {
       authorization: AuthorizationState
+      openauthIssuer: string
     }
   }>().use(logger())
+  app.use(async (c, next) => {
+    if (configuredIssuer) c.set("openauthIssuer", configuredIssuer)
+    await next()
+  })
+  app.use("/token", async (c, next) => {
+    c.header("Cache-Control", "no-store")
+    c.header("Pragma", "no-cache")
+    await next()
+  })
 
   for (const [name, value] of Object.entries(input.providers)) {
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error("Invalid provider name")
     const route = new Hono<any>()
     route.use(async (c, next) => {
       c.set("provider", name)
@@ -781,7 +778,8 @@ export function issuer<
         authorization_endpoint: `${iss}/authorize`,
         token_endpoint: `${iss}/token`,
         jwks_uri: `${iss}/.well-known/jwks.json`,
-        response_types_supported: ["code", "token"],
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
       })
     },
   )
@@ -796,6 +794,12 @@ export function issuer<
     }),
     async (c) => {
       const form = await c.req.formData()
+      for (const name of ["grant_type", "code", "redirect_uri", "client_id", "code_verifier", "refresh_token", "provider", "client_secret"]) {
+        const values = form.getAll(name)
+        if (values.length > 1 || values.some((value) => typeof value !== "string")) {
+          return c.json({ error: "invalid_request", error_description: `Invalid ${name}` }, 400)
+        }
+      }
       const grantType = form.get("grant_type")
 
       if (grantType === "authorization_code") {
@@ -820,8 +824,9 @@ export function issuer<
             refresh: number
           }
           pkce?: AuthorizationState["pkce"]
+          expiresAt: number
         }>(storage, key)
-        if (!payload) {
+        if (!payload || !Number.isSafeInteger(payload.expiresAt) || payload.expiresAt <= Date.now()) {
           return c.json(
             {
               error: "invalid_grant",
@@ -850,37 +855,19 @@ export function issuer<
           )
         }
 
-        if (payload.pkce) {
-          const codeVerifier = form.get("code_verifier")?.toString()
-          if (!codeVerifier)
-            return c.json(
-              {
-                error: "invalid_grant",
-                error_description: "Missing code_verifier",
-              },
-              400,
-            )
-
-          if (
-            !(await validatePKCE(
-              codeVerifier,
-              payload.pkce.challenge,
-              payload.pkce.method,
-            ))
-          ) {
-            return c.json(
-              {
-                error: "invalid_grant",
-                error_description: "Code verifier does not match",
-              },
-              400,
-            )
-          }
+        const codeVerifier = form.get("code_verifier")?.toString()
+        if (
+          !payload.pkce || !codeVerifier ||
+          !(await validatePKCE(codeVerifier, payload.pkce.challenge, payload.pkce.method))
+        ) {
+          return c.json({ error: "invalid_grant", error_description: "Invalid PKCE proof" }, 400)
         }
+        // TODO: replace get/remove with atomic consume on a transactional store.
         const tokens = await generateTokens(c, payload)
         await Storage.remove(storage, key)
         return c.json({
           access_token: tokens.access,
+          token_type: "Bearer",
           expires_in: tokens.expiresIn,
           refresh_token: tokens.refresh,
         })
@@ -921,6 +908,9 @@ export function issuer<
             400,
           )
         }
+        if (form.get("client_id") !== payload.clientID) {
+          return c.json({ error: "invalid_grant", error_description: "Client mismatch" }, 400)
+        }
         const generateRefreshToken = !payload.timeUsed
         if (ttlRefreshReuse <= 0) {
           // no reuse interval, remove the refresh token immediately
@@ -949,6 +939,7 @@ export function issuer<
         })
         return c.json({
           access_token: tokens.access,
+          token_type: "Bearer",
           refresh_token: tokens.refresh,
           expires_in: tokens.expiresIn,
         })
@@ -958,7 +949,9 @@ export function issuer<
         const provider = form.get("provider")
         if (!provider)
           return c.json({ error: "missing `provider` form value" }, 400)
-        const match = input.providers[provider.toString()]
+        const match = Object.hasOwn(input.providers, provider.toString())
+          ? input.providers[provider.toString()]
+          : undefined
         if (!match)
           return c.json({ error: "invalid `provider` query parameter" }, 400)
         if (!match.client)
@@ -993,7 +986,9 @@ export function issuer<
               })
               return c.json({
                 access_token: tokens.access,
+                token_type: "Bearer",
                 refresh_token: tokens.refresh,
+                expires_in: tokens.expiresIn,
               })
             },
           },
@@ -1005,63 +1000,49 @@ export function issuer<
         )
       }
 
-      throw new Error("Invalid grant_type")
+      return c.json({ error: "unsupported_grant_type" }, 400)
     },
   )
 
   app.get("/authorize", async (c) => {
-    const provider = c.req.query("provider")
-    const response_type = c.req.query("response_type")
-    const redirect_uri = c.req.query("redirect_uri")
-    const state = c.req.query("state")
-    const client_id = c.req.query("client_id")
-    const audience = c.req.query("audience")
-    const code_challenge = c.req.query("code_challenge")
-    const code_challenge_method = c.req.query("code_challenge_method")
+    const params = new URL(c.req.url).searchParams
+    for (const name of ["provider", "response_type", "redirect_uri", "state", "client_id", "audience", "code_challenge", "code_challenge_method"]) {
+      if (params.getAll(name).length > 1) {
+        return c.json({ error: "invalid_request", error_description: `Duplicate ${name}` }, 400)
+      }
+    }
+    const provider = params.get("provider")
+    const redirect_uri = params.get("redirect_uri")
+    const client_id = params.get("client_id")
+    const challenge = params.get("code_challenge")
+    const method = params.get("code_challenge_method")
+    if (!client_id || !isSafeRedirectURI(redirect_uri)) {
+      return c.json({ error: "invalid_request" }, 400)
+    }
+    if (params.get("response_type") !== "code") {
+      return c.json({ error: "unsupported_response_type" }, 400)
+    }
+    if (!isPKCEChallenge(challenge, method)) {
+      return c.json({ error: "invalid_request", error_description: "S256 PKCE is required" }, 400)
+    }
+    if (provider !== null && !Object.hasOwn(input.providers, provider)) {
+      return c.json({ error: "invalid_request", error_description: "Unknown provider" }, 400)
+    }
     const authorization: AuthorizationState = {
-      response_type,
+      response_type: "code",
       redirect_uri,
-      state,
       client_id,
-      audience,
-      pkce:
-        code_challenge && code_challenge_method
-          ? {
-              challenge: code_challenge,
-              method: code_challenge_method,
-            }
-          : undefined,
-    } as AuthorizationState
+      state: params.get("state") ?? "",
+      audience: params.get("audience") ?? undefined,
+      pkce: { challenge, method: "S256" },
+    }
+    if (!(await allowAuthorization(authorization, c.req.raw))) {
+      return c.json({ error: "unauthorized_client" }, 400)
+    }
+    // Only validated destinations are eligible for later error redirects.
     c.set("authorization", authorization)
-
-    if (!redirect_uri) {
-      return c.text("Missing redirect_uri", { status: 400 })
-    }
-
-    if (!response_type) {
-      throw new MissingParameterError("response_type")
-    }
-
-    if (!client_id) {
-      throw new MissingParameterError("client_id")
-    }
-
-    if (input.start) {
-      await input.start(c.req.raw)
-    }
-
-    if (
-      !(await allow()(
-        {
-          clientID: client_id,
-          redirectURI: redirect_uri,
-          audience,
-        },
-        c.req.raw,
-      ))
-    )
-      throw new UnauthorizedClientError(client_id, redirect_uri)
-    await auth.set(c, "authorization", 60 * 60 * 24, authorization)
+    if (input.start) await input.start(c.req.raw)
+    await auth.set(c, "authorization", 60 * 10, authorization)
     if (provider) return c.redirect(`/${provider}/authorize`)
     const providers = Object.keys(input.providers)
     if (providers.length === 1) return c.redirect(`/${providers[0]}/authorize`)
@@ -1138,18 +1119,30 @@ export function issuer<
 
   app.onError(async (err, c) => {
     console.error(err)
+    const oauth = err instanceof OauthError
+      ? err
+      : new OauthError("server_error", "Internal server error")
+    const body = { error: oauth.error, error_description: oauth.description }
+    // Token/API errors must never use browser cookies as a redirect destination.
+    if (c.req.path === "/token") return c.json(body, err instanceof OauthError ? 400 : 500)
+    if (c.req.path === "/userinfo") {
+      c.header("WWW-Authenticate", 'Bearer error="invalid_token"')
+      return c.json({ error: "invalid_token" }, 401)
+    }
+    if (c.req.path === "/authorize") return c.json(body, err instanceof OauthError ? 400 : 500)
     if (err instanceof UnknownStateError) {
       return auth.forward(c, await error(err, c.req.raw))
     }
-    const authorization = await getAuthorization(c)
-    const url = new URL(authorization.redirect_uri)
-    const oauth =
-      err instanceof OauthError
-        ? err
-        : new OauthError("server_error", err.message)
-    url.searchParams.set("error", oauth.error)
-    url.searchParams.set("error_description", oauth.description)
-    return c.redirect(url.toString())
+    try {
+      const authorization = await getAuthorization(c)
+      const url = new URL(authorization.redirect_uri)
+      url.searchParams.set("error", oauth.error)
+      url.searchParams.set("error_description", oauth.description)
+      url.searchParams.set("state", authorization.state)
+      return c.redirect(url.toString())
+    } catch {
+      return c.json(body, 400)
+    }
   })
 
   return app

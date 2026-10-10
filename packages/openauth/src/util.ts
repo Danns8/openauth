@@ -5,11 +5,18 @@ export type Prettify<T> = {
 }
 
 export function getRelativeUrl(ctx: Context, path: string) {
-  const result = new URL(path, ctx.req.url)
-  result.host = ctx.req.header("x-forwarded-host") || result.host
-  result.protocol = ctx.req.header("x-forwarded-proto") || result.protocol
-  result.port = ctx.req.header("x-forwarded-port") || result.port
-  return result.toString()
+  const requestURL = new URL(ctx.req.url)
+  const origin = ctx.get("openauthIssuer") as string | undefined
+  if (origin) {
+    const publicURL = new URL(origin)
+    requestURL.protocol = publicURL.protocol
+    requestURL.hostname = publicURL.hostname
+    requestURL.port = publicURL.port
+    requestURL.username = ""
+    requestURL.password = ""
+  }
+  // Forwarding headers are untrusted input. Configure issuer.issuer behind a proxy.
+  return new URL(path, requestURL).toString()
 }
 
 const twoPartTlds = [
@@ -33,6 +40,7 @@ const twoPartTlds = [
   "gov.au",
 ]
 
+/** Domain grouping only; never use this helper to authorize OAuth redirects. */
 export function isDomainMatch(a: string, b: string): boolean {
   if (a === b) return true
   const partsA = a.split(".")

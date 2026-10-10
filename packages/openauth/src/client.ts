@@ -18,7 +18,7 @@
  * ```ts
  * const redirect_uri = "https://myserver.com/callback"
  *
- * const { url } = await client.authorize(
+ * const { challenge, url } = await client.authorize(
  *   redirect_uri,
  *   "code"
  * )
@@ -27,7 +27,7 @@
  * When the user completes the flow, `exchange` the code for tokens.
  *
  * ```ts
- * const tokens = await client.exchange(query.get("code"), redirect_uri)
+ * const tokens = await client.exchange(query.get("code"), redirect_uri, challenge.verifier)
  * ```
  *
  * And `verify` the tokens.
@@ -152,7 +152,7 @@ export interface ClientInput {
 
 export interface AuthorizeOptions {
   /**
-   * Enable the PKCE flow. This is for SPA apps.
+   * Use S256 PKCE for both server-side web clients and SPA apps.
    *
    * ```ts
    * {
@@ -160,7 +160,8 @@ export interface AuthorizeOptions {
    * }
    * ```
    *
-   * @default false
+   * PKCE is always enabled. Passing false is rejected.
+   * @default true
    */
   pkce?: boolean
   /**
@@ -286,7 +287,8 @@ export interface VerifyOptions {
    */
   issuer?: string
   /**
-   * @internal
+   * Trusted expected audience for a shared resource server. Defaults to clientID.
+   * Never populate this option from an untrusted request or the token itself.
    */
   audience?: string
   /**
@@ -354,8 +356,7 @@ export interface Client {
    * This takes a redirect URI and the type of flow you want to use. The redirect URI is the
    * location where the user will be redirected to after the flow is complete.
    *
-   * Supports both the _code_ and _token_ flows. We recommend using the _code_ flow as it's more
-   * secure.
+   * Only authorization code flow with S256 PKCE is supported. The token flow is rejected.
    *
    * :::tip
    * This returns a URL to redirect the user to. This starts the OAuth flow.
@@ -397,12 +398,8 @@ export interface Client {
    * So the code comes from the query parameter in the redirect URI. The redirect URI here is
    * the one that you passed in to the `authorize` call when starting the flow.
    *
-   * :::tip
-   * For SPA sites, the code is returned through the URL hash.
-   * :::
-   *
-   * If you used the PKCE flow for an SPA app, the code is returned as a part of the redirect URL
-   * hash.
+   * For both SPA and server-side apps, read the code and state from the callback
+   * query string. Compare state to the saved transaction before exchanging the code.
    *
    * ```ts {4}
    * const exchanged = await client.exchange(
@@ -579,6 +576,9 @@ export function createClient(input: ClientInput): Client {
       response: "code" | "token",
       opts?: AuthorizeOptions,
     ) {
+      if (response !== "code" || opts?.pkce === false) {
+        throw new Error("Only authorization code flow with S256 PKCE is supported")
+      }
       const result = new URL(issuer + "/authorize")
       const challenge: Challenge = {
         state: crypto.randomUUID(),
@@ -588,7 +588,7 @@ export function createClient(input: ClientInput): Client {
       result.searchParams.set("response_type", response)
       result.searchParams.set("state", challenge.state)
       if (opts?.provider) result.searchParams.set("provider", opts.provider)
-      if (opts?.pkce && response === "code") {
+      {
         const pkce = await generatePKCE()
         result.searchParams.set("code_challenge_method", "S256")
         result.searchParams.set("code_challenge", pkce.challenge)
@@ -600,7 +600,7 @@ export function createClient(input: ClientInput): Client {
       }
     },
     /**
-     * @deprecated use `authorize` instead, it will do pkce by default unless disabled with `opts.pkce = false`
+     * @deprecated use `authorize` and persist its challenge, including state, instead
      */
     async pkce(
       redirectURI: string,
@@ -613,6 +613,7 @@ export function createClient(input: ClientInput): Client {
       result.searchParams.set("client_id", input.clientID)
       result.searchParams.set("redirect_uri", redirectURI)
       result.searchParams.set("response_type", "code")
+      result.searchParams.set("state", crypto.randomUUID())
       const pkce = await generatePKCE()
       result.searchParams.set("code_challenge_method", "S256")
       result.searchParams.set("code_challenge", pkce.challenge)
@@ -656,12 +657,13 @@ export function createClient(input: ClientInput): Client {
       opts?: RefreshOptions,
     ): Promise<RefreshSuccess | RefreshError> {
       if (opts && opts.access) {
-        const decoded = decodeJwt(opts.access)
-        if (!decoded) {
-          return {
-            err: new InvalidAccessTokenError(),
-          }
+        let decoded
+        try {
+          decoded = decodeJwt(opts.access)
+        } catch {
+          return { err: new InvalidAccessTokenError() }
         }
+        // This is only a refresh optimization, not verification. Use verify() to authenticate.
         // allow 30s window for expiration
         if ((decoded.exp || 0) > Date.now() / 1000 + 30) {
           return {
@@ -676,6 +678,7 @@ export function createClient(input: ClientInput): Client {
         },
         body: new URLSearchParams({
           grant_type: "refresh_token",
+          client_id: input.clientID,
           refresh_token: refresh,
         }).toString(),
       })
@@ -699,15 +702,24 @@ export function createClient(input: ClientInput): Client {
       token: string,
       options?: VerifyOptions,
     ): Promise<VerifyResult<T> | VerifyError> {
-      const jwks = await getJWKS()
       try {
+        const jwks = await getJWKS()
         const result = await jwtVerify<{
           mode: "access"
           type: keyof T
           properties: v1.InferInput<T[keyof T]>
         }>(token, jwks, {
           issuer,
+          audience: options?.audience ?? input.clientID,
+          algorithms: ["ES256", "RS512"],
+          requiredClaims: ["iss", "aud", "exp", "sub"],
         })
+        if (
+          result.payload.mode !== "access" ||
+          typeof result.payload.sub !== "string" || !result.payload.sub ||
+          typeof result.payload.type !== "string" ||
+          !Object.hasOwn(subjects, result.payload.type)
+        ) return { err: new InvalidSubjectError() }
         const validated = await subjects[result.payload.type][
           "~standard"
         ].validate(result.payload.properties)
@@ -724,14 +736,14 @@ export function createClient(input: ClientInput): Client {
         }
       } catch (e) {
         if (e instanceof errors.JWTExpired && options?.refresh) {
-          const refreshed = await this.refresh(options.refresh)
+          const refreshed = await result.refresh(options.refresh)
           if (refreshed.err) return refreshed
           const verified = await result.verify(
             subjects,
             refreshed.tokens!.access,
             {
-              refresh: refreshed.tokens!.refresh,
-              issuer,
+              // Only one automatic refresh; re-verify with the same audience policy.
+              audience: options?.audience,
               fetch: options?.fetch,
             },
           )

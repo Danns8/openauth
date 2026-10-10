@@ -1,32 +1,33 @@
-import { base64url } from "jose"
-
-function generateVerifier(length: number): string {
-  const buffer = new Uint8Array(length)
-  crypto.getRandomValues(buffer)
-  return base64url.encode(buffer)
+function base64url(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "")
 }
 
-async function generateChallenge(verifier: string, method: "S256" | "plain") {
-  if (method === "plain") return verifier
-  const encoder = new TextEncoder()
-  const data = encoder.encode(verifier)
+export function isPKCEChallenge(challenge: unknown, method: unknown): challenge is string {
+  return method === "S256" && typeof challenge === "string" &&
+    /^[A-Za-z0-9_-]{43}$/.test(challenge)
+}
+
+export function isPKCEVerifier(verifier: unknown): verifier is string {
+  return typeof verifier === "string" && /^[A-Za-z0-9._~-]{43,128}$/.test(verifier)
+}
+
+async function generateChallenge(verifier: string) {
+  const data = new TextEncoder().encode(verifier)
   const hash = await crypto.subtle.digest("SHA-256", data)
-  return base64url.encode(new Uint8Array(hash))
+  return base64url(new Uint8Array(hash))
 }
 
 export async function generatePKCE(length: number = 64) {
-  if (length < 43 || length > 128) {
-    throw new Error(
-      "Code verifier length must be between 43 and 128 characters",
-    )
+  if (!Number.isInteger(length) || length < 43 || length > 128) {
+    throw new Error("Code verifier length must be between 43 and 128 characters")
   }
-  const verifier = generateVerifier(length)
-  const challenge = await generateChallenge(verifier, "S256")
-  return {
-    verifier,
-    challenge,
-    method: "S256",
-  }
+  const buffer = crypto.getRandomValues(new Uint8Array(Math.ceil(length * 3 / 4)))
+  const verifier = base64url(buffer).slice(0, length)
+  const challenge = await generateChallenge(verifier)
+  return { verifier, challenge, method: "S256" as const }
 }
 
 export async function validatePKCE(
@@ -34,7 +35,11 @@ export async function validatePKCE(
   challenge: string,
   method: "S256" | "plain" = "S256",
 ) {
-  const generatedChallenge = await generateChallenge(verifier, method)
-  // timing safe equals?
-  return generatedChallenge === challenge
+  if (!isPKCEVerifier(verifier) || !isPKCEChallenge(challenge, method)) return false
+  const generated = await generateChallenge(verifier)
+  let difference = 0
+  for (let i = 0; i < generated.length; i++) {
+    difference |= generated.charCodeAt(i) ^ challenge.charCodeAt(i)
+  }
+  return difference === 0
 }
