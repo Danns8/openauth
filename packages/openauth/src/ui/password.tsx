@@ -160,10 +160,11 @@ export function PasswordUI(input: PasswordUIOptions): PasswordConfig {
   return {
     validatePassword: input.validatePassword,
     sendCode: input.sendCode,
-    login: async (_req, form, error): Promise<Response> => {
+    login: async (_req, form, error, csrfToken): Promise<Response> => {
       const jsx = (
         <Layout>
           <form data-component="form" method="post">
+            <input type="hidden" name="csrf" value={csrfToken} />
             <FormAlert message={error?.type && copy?.[`error_${error.type}`]} />
             <input
               data-component="input"
@@ -205,7 +206,7 @@ export function PasswordUI(input: PasswordUIOptions): PasswordConfig {
         },
       })
     },
-    register: async (_req, state, form, error): Promise<Response> => {
+    register: async (_req, state, form, error, csrfToken): Promise<Response> => {
       const emailError = ["invalid_email", "email_taken"].includes(
         error?.type || "",
       )
@@ -217,6 +218,7 @@ export function PasswordUI(input: PasswordUIOptions): PasswordConfig {
       const jsx = (
         <Layout>
           <form data-component="form" method="post">
+            <input type="hidden" name="csrf" value={csrfToken} />
             <FormAlert
               message={
                 error?.type
@@ -296,7 +298,7 @@ export function PasswordUI(input: PasswordUIOptions): PasswordConfig {
         },
       })
     },
-    change: async (_req, state, form, error): Promise<Response> => {
+    change: async (_req, state, form, error, csrfToken): Promise<Response> => {
       const passwordError = [
         "invalid_password",
         "password_mismatch",
@@ -305,6 +307,7 @@ export function PasswordUI(input: PasswordUIOptions): PasswordConfig {
       const jsx = (
         <Layout>
           <form data-component="form" method="post" replace>
+            <input type="hidden" name="csrf" value={csrfToken} />
             <FormAlert
               message={
                 error?.type
@@ -375,6 +378,7 @@ export function PasswordUI(input: PasswordUIOptions): PasswordConfig {
           </form>
           {state.type === "code" && (
             <form method="post">
+              <input type="hidden" name="csrf" value={csrfToken} />
               <input type="hidden" name="action" value="code" />
               <input type="hidden" name="email" value={state.email} />
               {state.type === "code" && (

@@ -24,9 +24,10 @@
 
 import { createRemoteJWKSet, jwtVerify } from "jose"
 import { OauthError } from "../error.js"
-import { generatePKCE } from "../pkce.js"
+import { generatePKCE, isPKCEVerifier } from "../pkce.js"
 import { getRelativeUrl } from "../util.js"
 import { Provider } from "./provider.js"
+import { isOAuthCallbackState, type OAuthCallbackState } from "../security.js"
 
 export interface Oauth2Config {
   /**
@@ -135,16 +136,16 @@ export interface Oauth2Token {
   raw: Record<string, any>
 }
 
-interface ProviderState {
-  state: string
-  redirect: string
-  codeVerifier?: string
-}
+type ProviderState = OAuthCallbackState
 
 export function Oauth2Provider(
   config: Oauth2Config,
 ): Provider<{ tokenset: Oauth2Token; clientID: string }> {
   const query = config.query || {}
+  const reserved = new Set(["client_id", "redirect_uri", "response_type", "state", "scope", "code_challenge", "code_challenge_method"])
+  if (Object.keys(query).some((key) => reserved.has(key))) {
+    throw new Error("OAuth query cannot override protocol security parameters")
+  }
 
   // Helper function to handle token exchange and response building
   async function handleCallbackLogic(
@@ -168,19 +169,26 @@ export function Oauth2Provider(
         : {}),
     })
 
-    const json: any = await fetch(config.endpoint.token, {
+    const response = await fetch(config.endpoint.token, {
       method: "POST",
+      redirect: "error",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
         Accept: "application/json",
       },
       body: body.toString(),
-    }).then((r) => r.json())
-
+    })
+    const json: any = await response.json()
+    if (!json || typeof json !== "object") {
+      throw new OauthError("invalid_grant", "Invalid provider token response")
+    }
     if ("error" in json) {
       throw new OauthError(json.error, json.error_description)
     }
 
+    if (!response.ok || typeof json.access_token !== "string" || !json.access_token) {
+      throw new OauthError("invalid_grant", "Invalid provider token response")
+    }
     let idTokenPayload: Record<string, any> | null = null
     if (config.endpoint.jwks) {
       const jwksEndpoint = new URL(config.endpoint.jwks)
@@ -192,6 +200,7 @@ export function Oauth2Provider(
       idTokenPayload = payload
     }
 
+    await ctx.unset(c, "provider")
     return ctx.success(c, {
       clientID: config.clientID,
       tokenset: {
@@ -222,6 +231,8 @@ export function Oauth2Provider(
         const state = crypto.randomUUID()
         const pkce = config.pkce ? await generatePKCE() : undefined
         await ctx.set<ProviderState>(c, "provider", 60 * 10, {
+          kind: "oauth2",
+          provider: ctx.name,
           state,
           redirect: getRelativeUrl(c, "./callback"),
           codeVerifier: pkce?.verifier,
@@ -246,50 +257,40 @@ export function Oauth2Provider(
       })
 
       routes.get("/callback", async (c) => {
-        const provider = (await ctx.get(c, "provider")) as ProviderState
-        const code = c.req.query("code")
-        const state = c.req.query("state")
-        const error = c.req.query("error")
-
-        if (error)
-          throw new OauthError(
-            error.toString() as any,
-            c.req.query("error_description")?.toString() || "",
-          )
-        if (
-          !provider ||
-          !code ||
-          (provider.state && state !== provider.state)
-        ) {
-          return c.redirect(getRelativeUrl(c, "./authorize"))
+        const params = new URL(c.req.url).searchParams
+        for (const key of ["code", "state", "error", "error_description"]) {
+          if (params.getAll(key).length > 1) throw new OauthError("invalid_request", "Duplicate callback parameter")
         }
-
+        const provider = await ctx.get(c, "provider")
+        const state = params.get("state")
+        if (
+          !isOAuthCallbackState(provider, ctx.name, state, getRelativeUrl(c, "./callback")) ||
+          (config.pkce && !isPKCEVerifier(provider.codeVerifier))
+        ) throw new OauthError("invalid_request", "Invalid OAuth state")
+        const error = params.get("error")
+        if (error) throw new OauthError("access_denied", "Provider authorization failed")
+        const code = params.get("code")
+        if (!code) throw new OauthError("invalid_request", "Missing code")
         return handleCallbackLogic(c, ctx, provider, code)
       })
 
       routes.post("/callback", async (c) => {
-        const provider = (await ctx.get(c, "provider")) as ProviderState
-
-        // Handle form data from POST request
-        const formData = await c.req.formData()
-        const code = formData.get("code")?.toString()
-        const state = formData.get("state")?.toString()
-        const error = formData.get("error")?.toString()
-
-        if (error)
-          throw new OauthError(
-            error as any,
-            formData.get("error_description")?.toString() || "",
-          )
-
-        if (
-          !provider ||
-          !code ||
-          (provider.state && state !== provider.state)
-        ) {
-          return c.redirect(getRelativeUrl(c, "./authorize"))
+        const form = await c.req.formData()
+        for (const key of ["code", "state", "error", "error_description"]) {
+          const values = form.getAll(key)
+          if (values.length > 1 || values.some((value) => typeof value !== "string")) {
+            throw new OauthError("invalid_request", "Invalid callback parameter")
+          }
         }
-
+        const provider = await ctx.get(c, "provider")
+        const state = form.get("state")
+        if (
+          !isOAuthCallbackState(provider, ctx.name, state, getRelativeUrl(c, "./callback")) ||
+          (config.pkce && !isPKCEVerifier(provider.codeVerifier))
+        ) throw new OauthError("invalid_request", "Invalid OAuth state")
+        if (form.get("error")) throw new OauthError("access_denied", "Provider authorization failed")
+        const code = form.get("code")
+        if (typeof code !== "string" || !code) throw new OauthError("invalid_request", "Missing code")
         return handleCallbackLogic(c, ctx, provider, code)
       })
     },

@@ -37,11 +37,13 @@
  *
  * @packageDocumentation
  */
-import { UnknownStateError } from "../error.js"
-import { Storage } from "../storage/storage.js"
+import { Storage, type StorageAdapter } from "../storage/storage.js"
+import type { SecurityStorage } from "../storage/security.js"
 import { Provider } from "./provider.js"
 import { generateUnbiasedDigits, timingSafeCompare } from "../random.js"
 import { v1 } from "@standard-schema/spec"
+import type { Context } from "hono"
+import { hashSecret, passwordReturnURL, randomSecret, validPasswordOrigin } from "../security-utils.js"
 
 /**
  * @internal
@@ -76,6 +78,8 @@ export interface PasswordConfig {
     req: Request,
     form?: FormData,
     error?: PasswordLoginError,
+    /** 自定义表单必须将此值放入名为 csrf 的隐藏字段。 */
+    csrfToken?: string,
   ) => Promise<Response>
   /**
    * The request handler to generate the UI for the register screen.
@@ -94,6 +98,8 @@ export interface PasswordConfig {
     state: PasswordRegisterState,
     form?: FormData,
     error?: PasswordRegisterError,
+    /** 自定义表单必须将此值放入名为 csrf 的隐藏字段。 */
+    csrfToken?: string,
   ) => Promise<Response>
   /**
    * The request handler to generate the UI for the change password screen.
@@ -112,6 +118,8 @@ export interface PasswordConfig {
     state: PasswordChangeState,
     form?: FormData,
     error?: PasswordChangeError,
+    /** 自定义表单必须将此值放入名为 csrf 的隐藏字段。 */
+    csrfToken?: string,
   ) => Promise<Response>
   /**
    * Callback to send the confirmation pin code to the user.
@@ -157,8 +165,10 @@ export type PasswordRegisterState =
     }
   | {
       type: "code"
+      /** @deprecated 保留字段兼容 UI 类型，值为空；验证码只在服务端处理。 */
       code: string
       email: string
+      /** @deprecated 保留字段兼容 UI 类型，值为空；密码哈希不发送给 UI。 */
       password: string
     }
 
@@ -210,6 +220,7 @@ export type PasswordChangeState =
     }
   | {
       type: "code"
+      /** @deprecated 保留字段兼容 UI 类型，值为空；验证码只在服务端处理。 */
       code: string
       email: string
       redirect: string
@@ -264,274 +275,241 @@ export type PasswordLoginError =
       type: "invalid_email"
     }
 
+interface PasswordHandle {
+  kind: "login" | "register" | "reset"
+  csrf: string
+  flowID?: string
+  redirect?: string
+}
+
 export function PasswordProvider(
   config: PasswordConfig,
 ): Provider<{ email: string }> {
   const hasher = config.hasher ?? ScryptHasher()
-  function generate() {
-    return generateUnbiasedDigits(6)
+  const dummyHash = lazy(() => hasher.hash(randomSecret()))
+
+  async function validate(password: string) {
+    if (password.length > 1024) return "Password is too long"
+    if (!config.validatePassword) {
+      return password.length < 12 ? "Password must contain at least 12 characters" : undefined
+    }
+    try {
+      if (typeof config.validatePassword === "function") return await config.validatePassword(password)
+      const result = await config.validatePassword["~standard"].validate(password)
+      return result.issues?.length ? "Password does not meet requirements" : undefined
+    } catch {
+      // 校验器异常必须拒绝密码，不能因非 Error 异常而默认为通过。
+      return "Password validation failed"
+    }
   }
+
+  function emailOf(value: FormDataEntryValue | null) {
+    if (typeof value !== "string") return
+    const email = value.trim().toLowerCase()
+    if (email.length > 254 || !/^[^\s@\u0000-\u001f\u007f]+@[^\s@\u0000-\u001f\u007f]+$/.test(email)) return
+    return email
+  }
+
   return {
     type: "password",
     init(routes, ctx) {
-      routes.get("/authorize", async (c) =>
-        ctx.forward(c, await config.login(c.req.raw)),
-      )
+      const accountKey = (email: string) => JSON.stringify([ctx.name, email])
+      const cookieKey = (kind: PasswordHandle["kind"]) => `password_${ctx.name}_${kind}`
+
+      async function credentialFor(email: string) {
+        // 迁移由受信任的管理操作显式执行；运行时不读取 KV，避免误切命名空间后旧密码复活。
+        return ctx.security.execute("getCredential", { account: accountKey(email) })
+      }
+
+      async function start(c: Context, kind: PasswordHandle["kind"], redirect?: string) {
+        const handle: PasswordHandle = { kind, csrf: randomSecret(), redirect }
+        await ctx.set(c, cookieKey(kind), 600, handle)
+        return handle
+      }
+
+      async function read(c: Context, kind: PasswordHandle["kind"], form: FormData) {
+        const handle = await ctx.get<PasswordHandle | undefined>(c, cookieKey(kind))
+        const csrf = form.get("csrf")
+        if (!handle || handle.kind !== kind || typeof csrf !== "string" ||
+            !/^[A-Za-z0-9_-]{43}$/.test(csrf) || !timingSafeCompare(csrf, handle.csrf) ||
+            !validPasswordOrigin(c.req.raw, new URL(getRelativeUrl(c, "/")).origin)) {
+          return undefined
+        }
+        for (const name of ["action", "email", "password", "repeat", "code", "csrf"]) {
+          const values = form.getAll(name)
+          if (values.length > 1 || values.some((value) => typeof value !== "string")) return undefined
+        }
+        return handle
+      }
+
+      async function view(handle: PasswordHandle) {
+        if (!handle.flowID) return
+        return ctx.security.execute("getFlow", {
+          flowID: handle.flowID, csrfHash: await hashSecret(handle.csrf),
+        })
+      }
+
+      routes.get("/authorize", async (c) => {
+        const handle = await start(c, "login")
+        return ctx.forward(c, await config.login(c.req.raw, undefined, undefined, handle.csrf))
+      })
 
       routes.post("/authorize", async (c) => {
-        const fd = await c.req.formData()
-        async function error(err: PasswordLoginError) {
-          return ctx.forward(c, await config.login(c.req.raw, fd, err))
-        }
-        const email = fd.get("email")?.toString()?.toLowerCase()
+        const form = await c.req.formData()
+        const handle = await read(c, "login", form)
+        if (!handle) return c.text("Invalid login request", 400)
+        const error = (err: PasswordLoginError) =>
+          config.login(c.req.raw, form, err, handle.csrf).then((response) => ctx.forward(c, response))
+        const email = emailOf(form.get("email"))
+        const password = form.get("password")?.toString()
         if (!email) return error({ type: "invalid_email" })
-        const hash = await Storage.get<HashedPassword>(ctx.storage, [
-          "email",
-          email,
-          "password",
-        ])
-        const password = fd.get("password")?.toString()
-        if (!password || !hash || !(await hasher.verify(password, hash)))
+        if (!password || password.length > 1024) return error({ type: "invalid_password" })
+        const account = accountKey(email)
+        if (!(await ctx.security.execute("loginAttempt", { account }))) {
+          c.header("Retry-After", "900")
+          return c.text("Too many login attempts", 429)
+        }
+        const credential = await credentialFor(email)
+        const valid = await hasher.verify(password, credential?.hash ?? await dummyHash())
+        if (!valid || !credential ||
+            !(await ctx.security.execute("finishLogin", { account, version: credential.version }))) {
           return error({ type: "invalid_password" })
-        return ctx.success(
-          c,
-          {
-            email: email,
-          },
-          {
-            invalidate: async (subject) => {
-              await Storage.set(
-                ctx.storage,
-                ["email", email, "subject"],
-                subject,
-              )
-            },
-          },
-        )
+        }
+        await ctx.unset(c, cookieKey("login"))
+        return ctx.success(c, { email }, {
+          credential: { account, version: credential.version },
+        })
       })
 
       routes.get("/register", async (c) => {
-        const state: PasswordRegisterState = {
-          type: "start",
-        }
-        await ctx.set(c, "provider", 60 * 60 * 24, state)
-        return ctx.forward(c, await config.register(c.req.raw, state))
+        const handle = await start(c, "register")
+        return ctx.forward(c, await config.register(c.req.raw, { type: "start" }, undefined, undefined, handle.csrf))
       })
 
       routes.post("/register", async (c) => {
-        const fd = await c.req.formData()
-        const email = fd.get("email")?.toString()?.toLowerCase()
-        const action = fd.get("action")?.toString()
-        const provider = await ctx.get<PasswordRegisterState>(c, "provider")
-
-        async function transition(
-          next: PasswordRegisterState,
-          err?: PasswordRegisterError,
-        ) {
-          await ctx.set<PasswordRegisterState>(
-            c,
-            "provider",
-            60 * 60 * 24,
-            next,
-          )
-          return ctx.forward(c, await config.register(c.req.raw, next, fd, err))
-        }
-
-        if (action === "register" && provider.type === "start") {
-          const password = fd.get("password")?.toString()
-          const repeat = fd.get("repeat")?.toString()
-          if (!email) return transition(provider, { type: "invalid_email" })
-          if (!password)
-            return transition(provider, { type: "invalid_password" })
-          if (password !== repeat)
-            return transition(provider, { type: "password_mismatch" })
-          if (config.validatePassword) {
-            let validationError: string | undefined
-            try {
-              if (typeof config.validatePassword === "function") {
-                validationError = await config.validatePassword(password)
-              } else {
-                const res =
-                  await config.validatePassword["~standard"].validate(password)
-
-                if (res.issues?.length) {
-                  throw new Error(
-                    res.issues.map((issue) => issue.message).join(", "),
-                  )
-                }
-              }
-            } catch (error) {
-              validationError =
-                error instanceof Error ? error.message : undefined
+        const form = await c.req.formData()
+        const handle = await read(c, "register", form)
+        if (!handle) return c.text("Invalid registration request", 400)
+        const flow = await view(handle)
+        const state: PasswordRegisterState = flow
+          ? { type: "code", email: flow.email, code: "", password: "" }
+          : { type: "start" }
+        const render = (next: PasswordRegisterState, error?: PasswordRegisterError) =>
+          config.register(c.req.raw, next, form, error, handle.csrf).then((response) => ctx.forward(c, response))
+        const action = form.get("action")
+        if (action === "register") {
+          const email = flow?.email ?? emailOf(form.get("email"))
+          if (!email) return render(state, { type: "invalid_email" })
+          let passwordHash: unknown
+          if (!flow) {
+            const password = form.get("password")?.toString()
+            if (!password) return render(state, { type: "invalid_password" })
+            if (password !== form.get("repeat")) return render(state, { type: "password_mismatch" })
+            const message = await validate(password)
+            if (message) return render(state, { type: "validation_error", message })
+            if (!(await ctx.security.execute("loginAttempt", { account: "register:" + accountKey(email) }))) {
+              return c.text("Too many registration attempts", 429)
             }
-            if (validationError)
-              return transition(provider, {
-                type: "validation_error",
-                message: validationError,
-              })
+            passwordHash = await hasher.hash(password)
           }
-          const existing = await Storage.get(ctx.storage, [
-            "email",
-            email,
-            "password",
-          ])
-          if (existing) return transition(provider, { type: "email_taken" })
-          const code = generate()
+          const code = generateUnbiasedDigits(6)
+          const flowID = crypto.randomUUID()
+          const status = await ctx.security.execute("beginFlow", {
+            flowID, kind: "register", account: accountKey(email), email,
+            csrfHash: await hashSecret(handle.csrf),
+            codeHash: await hashSecret(JSON.stringify([flowID, code])),
+            passwordHash, previousFlowID: handle.flowID,
+          })
+          if (status === "limited") {
+            c.header("Retry-After", "3600")
+            return c.text("Too many verification messages", 429)
+          }
+          if (status !== "ok") return render({ type: "start" }, { type: "email_taken" })
+          handle.flowID = flowID
+          await ctx.set(c, cookieKey("register"), 600, handle)
+          // 事务已经提交后才发送邮件；邮件失败不会回滚次数或恢复旧验证码。
           await config.sendCode(email, code)
-          return transition({
-            type: "code",
-            code,
-            password: await hasher.hash(password),
-            email,
-          })
+          return render({ type: "code", email, code: "", password: "" })
         }
-
-        if (action === "register" && provider.type === "code") {
-          const code = generate()
-          await config.sendCode(provider.email, code)
-          return transition({
-            type: "code",
-            code,
-            password: provider.password,
-            email: provider.email,
+        if (action === "verify" && handle.flowID && flow?.kind === "register") {
+          const result = await ctx.security.execute("verifyFlow", {
+            flowID: handle.flowID, csrfHash: await hashSecret(handle.csrf),
+            codeHash: await hashSecret(JSON.stringify([handle.flowID, form.get("code")?.toString() ?? ""])),
           })
+          if (!result.ok) {
+            return render(state, { type: result.reason === "exists" ? "email_taken" : "invalid_code" })
+          }
+          if (result.kind !== "register" || !result.credential) return render(state, { type: "invalid_code" })
+          await ctx.unset(c, cookieKey("register"))
+          return ctx.success(c, { email: result.email }, { credential: result.credential })
         }
-
-        if (action === "verify" && provider.type === "code") {
-          const code = fd.get("code")?.toString()
-          if (!code || !timingSafeCompare(code, provider.code))
-            return transition(provider, { type: "invalid_code" })
-          const existing = await Storage.get(ctx.storage, [
-            "email",
-            provider.email,
-            "password",
-          ])
-          if (existing)
-            return transition({ type: "start" }, { type: "email_taken" })
-          await Storage.set(
-            ctx.storage,
-            ["email", provider.email, "password"],
-            provider.password,
-          )
-          return ctx.success(c, {
-            email: provider.email,
-          })
-        }
-
-        return transition({ type: "start" })
+        return c.text("Invalid registration state", 400)
       })
 
       routes.get("/change", async (c) => {
-        let redirect =
-          c.req.query("redirect_uri") || getRelativeUrl(c, "./authorize")
-        const state: PasswordChangeState = {
-          type: "start",
-          redirect,
-        }
-        await ctx.set(c, "provider", 60 * 60 * 24, state)
-        return ctx.forward(c, await config.change(c.req.raw, state))
+        const redirect = passwordReturnURL(c.req.query("redirect_uri"), getRelativeUrl(c, "./authorize"))
+        if (!redirect) return c.text("Invalid return URL", 400)
+        const handle = await start(c, "reset", redirect)
+        return ctx.forward(c, await config.change(c.req.raw, { type: "start", redirect }, undefined, undefined, handle.csrf))
       })
 
       routes.post("/change", async (c) => {
-        const fd = await c.req.formData()
-        const action = fd.get("action")?.toString()
-        const provider = await ctx.get<PasswordChangeState>(c, "provider")
-        if (!provider) throw new UnknownStateError()
-
-        async function transition(
-          next: PasswordChangeState,
-          err?: PasswordChangeError,
-        ) {
-          await ctx.set<PasswordChangeState>(c, "provider", 60 * 60 * 24, next)
-          return ctx.forward(c, await config.change(c.req.raw, next, fd, err))
-        }
-
+        const form = await c.req.formData()
+        const handle = await read(c, "reset", form)
+        if (!handle) return c.text("Invalid password reset request", 400)
+        const redirect = passwordReturnURL(handle.redirect, getRelativeUrl(c, "./authorize"))
+        if (!redirect) return c.text("Invalid return URL", 400)
+        const flow = await view(handle)
+        const state: PasswordChangeState = !flow ? { type: "start", redirect } :
+          flow.phase === "code"
+            ? { type: "code", email: flow.email, code: "", redirect }
+            : { type: "update", email: flow.email, redirect }
+        const render = (next: PasswordChangeState, error?: PasswordChangeError) =>
+          config.change(c.req.raw, next, form, error, handle.csrf).then((response) => ctx.forward(c, response))
+        const action = form.get("action")
         if (action === "code") {
-          const email = fd.get("email")?.toString()?.toLowerCase()
-          if (!email)
-            return transition(
-              { type: "start", redirect: provider.redirect },
-              { type: "invalid_email" },
-            )
-          const code = generate()
-          await config.sendCode(email, code)
-
-          return transition({
-            type: "code",
-            code,
-            email,
-            redirect: provider.redirect,
+          const email = emailOf(form.get("email"))
+          if (!email) return render(state, { type: "invalid_email" })
+          const code = generateUnbiasedDigits(6)
+          const flowID = crypto.randomUUID()
+          const status = await ctx.security.execute("beginFlow", {
+            flowID, kind: "reset", account: accountKey(email), email,
+            csrfHash: await hashSecret(handle.csrf),
+            codeHash: await hashSecret(JSON.stringify([flowID, code])),
           })
-        }
-
-        if (action === "verify" && provider.type === "code") {
-          const code = fd.get("code")?.toString()
-          if (!code || !timingSafeCompare(code, provider.code))
-            return transition(provider, { type: "invalid_code" })
-          return transition({
-            type: "update",
-            email: provider.email,
-            redirect: provider.redirect,
-          })
-        }
-
-        if (action === "update" && provider.type === "update") {
-          const existing = await Storage.get(ctx.storage, [
-            "email",
-            provider.email,
-            "password",
-          ])
-          if (!existing) return c.redirect(provider.redirect, 302)
-
-          const password = fd.get("password")?.toString()
-          const repeat = fd.get("repeat")?.toString()
-          if (!password)
-            return transition(provider, { type: "invalid_password" })
-          if (password !== repeat)
-            return transition(provider, { type: "password_mismatch" })
-
-          if (config.validatePassword) {
-            let validationError: string | undefined
-            try {
-              if (typeof config.validatePassword === "function") {
-                validationError = await config.validatePassword(password)
-              } else {
-                const res =
-                  await config.validatePassword["~standard"].validate(password)
-
-                if (res.issues?.length) {
-                  throw new Error(
-                    res.issues.map((issue) => issue.message).join(", "),
-                  )
-                }
-              }
-            } catch (error) {
-              validationError =
-                error instanceof Error ? error.message : undefined
-            }
-            if (validationError)
-              return transition(provider, {
-                type: "validation_error",
-                message: validationError,
-              })
+          if (status !== "ok") {
+            c.header("Retry-After", "3600")
+            return c.text("Too many verification messages", 429)
           }
-
-          await Storage.set(
-            ctx.storage,
-            ["email", provider.email, "password"],
-            await hasher.hash(password),
-          )
-          const subject = await Storage.get<string>(ctx.storage, [
-            "email",
-            provider.email,
-            "subject",
-          ])
-          if (subject) await ctx.invalidate(subject)
-
-          return c.redirect(provider.redirect, 302)
+          handle.flowID = flowID
+          await ctx.set(c, cookieKey("reset"), 600, handle)
+          await config.sendCode(email, code)
+          return render({ type: "code", email, code: "", redirect })
         }
-
-        return transition({ type: "start", redirect: provider.redirect })
+        if (!flow || flow.kind !== "reset" || !handle.flowID) return c.text("Reset transaction expired", 400)
+        if (action === "verify") {
+          const result = await ctx.security.execute("verifyFlow", {
+            flowID: handle.flowID, csrfHash: await hashSecret(handle.csrf),
+            codeHash: await hashSecret(JSON.stringify([handle.flowID, form.get("code")?.toString() ?? ""])),
+          })
+          if (!result.ok || result.kind !== "reset") return render(state, { type: "invalid_code" })
+          return render({ type: "update", email: result.email, redirect })
+        }
+        if (action === "update" && flow.phase === "update") {
+          const password = form.get("password")?.toString()
+          if (!password) return render(state, { type: "invalid_password" })
+          if (password !== form.get("repeat")) return render(state, { type: "password_mismatch" })
+          const message = await validate(password)
+          if (message) return render(state, { type: "validation_error", message })
+          const completed = await ctx.security.execute("completeReset", {
+            flowID: handle.flowID, csrfHash: await hashSecret(handle.csrf),
+            passwordHash: await hasher.hash(password),
+          })
+          if (!completed) return c.text("Reset transaction is no longer valid", 400)
+          await ctx.unset(c, cookieKey("reset"))
+          return c.redirect(redirect, 302)
+        }
+        return c.text("Invalid reset state", 400)
       })
     },
   }
@@ -600,12 +578,12 @@ export function PBKDF2Hasher(opts?: { iterations?: number }): PasswordHasher<{
       )
       const hash = await crypto.subtle.deriveBits(params, keyMaterial, 256)
       const hashBase64 = jose.base64url.encode(new Uint8Array(hash))
-      return hashBase64 === compare.hash
+      return timingSafeCompare(hashBase64, compare.hash)
     },
   }
 }
 import { timingSafeEqual, randomBytes, scrypt } from "node:crypto"
-import { getRelativeUrl } from "../util.js"
+import { getRelativeUrl, lazy } from "../util.js"
 
 /**
  * @internal
@@ -669,4 +647,31 @@ export function ScryptHasher(opts?: {
       return timingSafeEqual(derivedKey, Buffer.from(compare.hash, "base64"))
     },
   }
+}
+
+/**
+ * 切换流量前，在受信任的 Worker 管理环境执行一次。
+ * 不覆盖已存在或已经改密的账号；不得把此迁移函数暴露为公共注册接口。
+ */
+export async function migratePasswordCredentials(
+  storage: StorageAdapter,
+  security: SecurityStorage,
+  providerName = "password",
+) {
+  if (!/^[A-Za-z0-9_-]+$/.test(providerName)) throw new Error("Invalid provider name")
+  let imported = 0
+  let skipped = 0
+  for await (const [parts, hash] of Storage.scan<HashedPassword>(storage, ["email"])) {
+    if (parts.length !== 3 || parts[0] !== "email" || parts[2] !== "password") continue
+    const email = parts[1]
+    if (email !== email.trim().toLowerCase() ||
+        /[\u0000-\u001f\u007f]/.test(email)) {
+      throw new Error("Legacy email requires manual normalization")
+    }
+    const account = JSON.stringify([providerName, email])
+    if (await security.execute("getCredential", { account })) { skipped++; continue }
+    await security.execute("importCredential", { account, hash })
+    imported++
+  }
+  return { imported, skipped }
 }

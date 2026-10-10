@@ -74,8 +74,10 @@ test("getRelativeUrl", () => {
   const createMockContext = (
     url: string,
     headers: Record<string, string> = {},
+    publicOrigin?: string,
   ) => {
     return {
+      get: () => publicOrigin,
       req: {
         url,
         header: (name: string) => headers[name.toLowerCase()] || "",
@@ -87,13 +89,16 @@ test("getRelativeUrl", () => {
   const ctx1 = createMockContext("http://example.com")
   expect(getRelativeUrl(ctx1, "/path")).toBe("http://example.com/path")
 
-  // Test with x-forwarded headers
+  // Untrusted forwarding headers are ignored
   const ctx2 = createMockContext("http://original.com", {
     "x-forwarded-host": "forwarded.com",
     "x-forwarded-proto": "https",
     "x-forwarded-port": "443",
   })
-  expect(getRelativeUrl(ctx2, "/path")).toBe("https://forwarded.com/path")
+  expect(getRelativeUrl(ctx2, "/path")).toBe("http://original.com/path")
+
+  const ctx3 = createMockContext("http://internal:8787", {}, "https://auth.example.com")
+  expect(getRelativeUrl(ctx3, "/path")).toBe("https://auth.example.com/path")
 
   // Test with absolute URLs
   const ctx4 = createMockContext("http://example.com")

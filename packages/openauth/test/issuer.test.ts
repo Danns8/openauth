@@ -27,8 +27,8 @@ const issuerConfig = {
   ttl: {
     access: 60,
     refresh: 6000,
-    refreshReuse: 60,
-    refreshRetention: 6000,
+    reuse: 60,
+    retention: 6000,
   },
   providers: {
     dummy: {
@@ -41,7 +41,7 @@ const issuerConfig = {
         })
       },
       client: async ({ clientID, clientSecret }) => {
-        if (clientID !== "myuser" && clientSecret !== "mypass") {
+        if (clientID !== "myuser" || clientSecret !== "mypass") {
           throw new Error("Wrong credentials")
         }
         return {
@@ -123,7 +123,7 @@ describe("client credentials flow", () => {
   test("success", async () => {
     const client = createClient({
       issuer: "https://auth.example.com",
-      clientID: "123",
+      clientID: "myuser",
       fetch: (a, b) => Promise.resolve(auth.request(a, b)),
     })
     const response = await auth.request("https://auth.example.com/token", {
@@ -143,6 +143,8 @@ describe("client credentials flow", () => {
     expect(tokens).toStrictEqual({
       access_token: expectNonEmptyString,
       refresh_token: expectNonEmptyString,
+      token_type: "Bearer",
+      expires_in: expect.any(Number),
     })
     const verified = await client.verify(subjects, tokens.access_token)
     expect(verified).toStrictEqual({
@@ -206,6 +208,7 @@ describe("refresh token", () => {
       },
       body: new URLSearchParams({
         grant_type: "refresh_token",
+        client_id: "123",
         ...(refresh_token ? { refresh_token } : {}),
       }).toString(),
     })
@@ -223,6 +226,7 @@ describe("refresh token", () => {
       access_token: expectNonEmptyString,
       refresh_token: expectNonEmptyString,
       expires_in: expect.any(Number),
+      token_type: "Bearer",
     })
     expect(refreshed.access_token).not.toEqual(tokens.access)
     expect(refreshed.refresh_token).not.toEqual(tokens.refresh)
@@ -249,6 +253,7 @@ describe("refresh token", () => {
       access_token: expectNonEmptyString,
       refresh_token: expectNonEmptyString,
       expires_in: expect.any(Number),
+      token_type: "Bearer",
     })
 
     expect(refreshed.access_token).not.toEqual(tokens.access)
