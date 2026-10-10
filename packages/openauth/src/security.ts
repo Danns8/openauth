@@ -1,5 +1,9 @@
 /** @internal */
-export type RegisteredClients = Record<string, { redirectURIs: readonly string[] }>
+export type RegisteredClients = Record<string, {
+  redirectURIs: readonly string[]
+  /** 仅机密客户端设置，必须来自服务端密钥配置；SPA 不得包含此值。 */
+  clientSecret?: string
+}>
 
 /** Validate syntax only. Authorization still requires an exact registered match. */
 export function isSafeRedirectURI(value: unknown): value is string {

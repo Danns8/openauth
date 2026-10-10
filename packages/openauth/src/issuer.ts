@@ -189,10 +189,12 @@ import {
   OauthError,
   UnknownStateError,
 } from "./error.js"
-import { compactDecrypt, CompactEncrypt, jwtVerify, SignJWT } from "jose"
-import { Storage, StorageAdapter } from "./storage/storage.js"
-import { encryptionKeys, legacySigningKeys, signingKeys } from "./keys.js"
-import { isPKCEChallenge, validatePKCE } from "./pkce.js"
+import { compactDecrypt, CompactEncrypt, decodeProtectedHeader, jwtVerify, SignJWT } from "jose"
+import { StorageAdapter } from "./storage/storage.js"
+import type { Grant, SecurityStorage } from "./storage/security.js"
+import { clientAuthenticator, expiringCache, hashSecret, newRefreshToken, parseRefreshToken } from "./security-utils.js"
+import { encryptionKeys, signingKeys } from "./keys.js"
+import { isPKCEChallenge, isPKCEVerifier } from "./pkce.js"
 import { issuerOrigin, isSafeRedirectURI, registeredRedirects, stateCookie, readStateCookie, type RegisteredClients } from "./security.js"
 import { Select } from "./ui/select.js"
 import { setTheme, Theme } from "./ui/theme.js"
@@ -250,6 +252,8 @@ export interface IssuerInput<
    * ```
    */
   storage?: StorageAdapter
+  /** 认证事务的权威存储；Cloudflare KV 部署必须传入 Durable Object 适配器。 */
+  security?: SecurityStorage
   /** Fixed public origin. Required when the request URL is an internal proxy URL. */
   issuer?: string
   /** Exact redirect URI registrations. Unknown clients are denied by default. */
@@ -346,10 +350,7 @@ export interface IssuerInput<
      * @default 60s
      */
     reuse?: number
-    /**
-     * Interval in seconds to retain refresh tokens for reuse detection.
-     * @default 0s
-     */
+    /** @deprecated 重放记录固定保留到刷新族的绝对截止时间，此值不再缩短保留期限。 */
     retention?: number
   }
   /**
@@ -456,7 +457,11 @@ export function issuer<
   const ttlAccess = input.ttl?.access ?? 60 * 60 * 24 * 30
   const ttlRefresh = input.ttl?.refresh ?? 60 * 60 * 24 * 365
   const ttlRefreshReuse = input.ttl?.reuse ?? 60
-  const ttlRefreshRetention = input.ttl?.retention ?? 0
+  if (!Number.isSafeInteger(ttlAccess) || ttlAccess <= 0 ||
+      !Number.isSafeInteger(ttlRefresh) || ttlRefresh <= 0 ||
+      !Number.isSafeInteger(ttlRefreshReuse) || ttlRefreshReuse < 0) {
+    throw new Error("Invalid token lifetime")
+  }
   if (input.theme) {
     setTheme(input.theme)
   }
@@ -464,6 +469,7 @@ export function issuer<
   const select = lazy(() => input.select ?? Select())
   const configuredIssuer = input.issuer !== undefined ? issuerOrigin(input.issuer) : undefined
   const registered = registeredRedirects(input.clients)
+  const authenticateClient = clientAuthenticator(input.clients)
   async function allowAuthorization(value: AuthorizationState, req: Request) {
     if (!isSafeRedirectURI(value.redirect_uri)) return false
     if (input.clients && !registered(value.client_id, value.redirect_uri)) return false
@@ -491,14 +497,22 @@ export function issuer<
     throw new Error(
       "Store is not configured. Either set the `storage` option or set `OPENAUTH_STORAGE` environment variable.",
     )
-  const allSigning = lazy(() =>
-    Promise.all([signingKeys(storage), legacySigningKeys(storage)]).then(
-      ([a, b]) => [...a, ...b],
-    ),
-  )
-  const allEncryption = lazy(() => encryptionKeys(storage))
-  const signingKey = lazy(() => allSigning().then((all) => all.find((key) => !key.expired)!))
-  const encryptionKey = lazy(() => allEncryption().then((all) => all.find((key) => !key.expired)!))
+  const security = input.security ?? storage.security
+  if (!security) {
+    throw new Error("A transactional security store is required; Cloudflare KV alone is not sufficient")
+  }
+  const allSigning = expiringCache(() => signingKeys(storage!, security))
+  const allEncryption = expiringCache(() => encryptionKeys(storage!, security))
+  async function signingKey() {
+    const key = (await allSigning()).find((item) => !item.expired)
+    if (!key) throw new Error("No active signing key")
+    return key
+  }
+  async function encryptionKey() {
+    const key = (await allEncryption()).find((item) => !item.expired)
+    if (!key) throw new Error("No active encryption key")
+    return key
+  }
 
   const auth: Omit<ProviderOptions<any>, "name"> = {
     async success(ctx: Context, properties: any, successOpts) {
@@ -512,24 +526,21 @@ export function issuer<
             await successOpts?.invalidate?.(subject)
             if (authorization.response_type === "code") {
               const code = crypto.randomUUID()
-              await Storage.set(
-                storage,
-                ["oauth:code", code],
-                {
-                  type,
-                  properties,
-                  subject,
-                  redirectURI: authorization.redirect_uri,
+              const accepted = await security.execute("issueCode", {
+                codeHash: await hashSecret(code),
+                grant: {
+                  type: type as string, properties, subject,
                   clientID: authorization.client_id,
-                  pkce: authorization.pkce,
-                  expiresAt: Date.now() + 60 * 1000,
                   ttl: {
                     access: subjectOpts?.ttl?.access ?? ttlAccess,
                     refresh: subjectOpts?.ttl?.refresh ?? ttlRefresh,
                   },
                 },
-                60,
-              )
+                redirectURI: authorization.redirect_uri,
+                challenge: authorization.pkce!.challenge,
+                credential: successOpts?.credential,
+              })
+              if (!accepted) throw new OauthError("invalid_grant", "Authentication was invalidated")
               const location = new URL(authorization.redirect_uri)
               location.searchParams.set("code", code)
               location.searchParams.set("state", authorization.state || "")
@@ -574,30 +585,34 @@ export function issuer<
       try {
         return readStateCookie<any>(await decrypt(raw), name)
       } catch {
-        // Invalid or old-format cookies are not authorization credentials.
+        // 无效、过期或旧格式 Cookie 不能作为新的认证凭据。
         return undefined
       }
     },
     async unset(ctx: Context, key: string) {
-      deleteCookie(ctx, cookieName(ctx, key), { path: "/" })
+      const name = cookieName(ctx, key)
+      // __Host- Cookie 的删除响应也必须带 Secure，否则浏览器会拒绝删除。
+      deleteCookie(ctx, name, {
+        path: "/",
+        ...(name.startsWith("__Host-") ? { secure: true } : {}),
+      })
     },
     async invalidate(subject: string) {
-      // Resolve the scan in case modifications interfere with iteration
-      const keys = await Array.fromAsync(
-        Storage.scan(this.storage, ["oauth:refresh", subject]),
-      )
-      for (const [key] of keys) {
-        await Storage.remove(this.storage, key)
-      }
+      await security.execute("revokeSubject", { subject })
     },
     storage,
+    security,
   }
 
   function cookieName(ctx: Context, key: string) {
-    if (key !== "provider") return key
-    const provider = ctx.get("provider") as string | undefined
-    if (!provider || !/^[A-Za-z0-9_-]+$/.test(provider)) throw new UnknownStateError()
-    return `provider_${provider}`
+    let name = key
+    if (key === "provider") {
+      const provider = ctx.get("provider") as string | undefined
+      if (!provider || !/^[A-Za-z0-9_-]+$/.test(provider)) throw new UnknownStateError()
+      name = `provider_${provider}`
+    }
+    // HTTPS 下禁止兄弟子域通过 Domain Cookie 覆盖认证事务。
+    return getRelativeUrl(ctx, "/").startsWith("https://") ? `__Host-${name}` : name
   }
 
   async function getAuthorization(ctx: Context): Promise<AuthorizationState> {
@@ -613,11 +628,10 @@ export function issuer<
   }
 
   async function encrypt(value: any) {
-    return await new CompactEncrypt(
-      new TextEncoder().encode(JSON.stringify(value)),
-    )
-      .setProtectedHeader({ alg: "RSA-OAEP-512", enc: "A256GCM" })
-      .encrypt(await encryptionKey().then((k) => k.public))
+    const key = await encryptionKey()
+    return new CompactEncrypt(new TextEncoder().encode(JSON.stringify(value)))
+      .setProtectedHeader({ alg: key.alg, enc: "A256GCM", kid: key.id })
+      .encrypt(key.public)
   }
 
   async function resolveSubject(type: string, properties: any) {
@@ -634,77 +648,50 @@ export function issuer<
 
   async function generateTokens(
     ctx: Context,
-    value: {
-      type: string
-      properties: any
-      subject: string
-      clientID: string
-      ttl: {
-        access: number
-        refresh: number
-      }
-      timeUsed?: number
-      nextToken?: string
-    },
-    opts?: {
-      generateRefreshToken?: boolean
-    },
+    value: Grant,
+    refreshToken?: string,
+    timeUsed = Date.now(),
   ) {
-    const refreshToken = value.nextToken ?? crypto.randomUUID()
-    if (opts?.generateRefreshToken ?? true) {
-      /**
-       * Generate and store the next refresh token after the one we are currently returning.
-       * Reserving these in advance avoids concurrency issues with multiple refreshes.
-       * Similar treatment should be given to any other values that may have race conditions,
-       * for example if a jti claim was added to the access token.
-       */
-      const refreshValue = {
-        ...value,
-        nextToken: crypto.randomUUID(),
-      }
-      delete refreshValue.timeUsed
-      await Storage.set(
-        storage!,
-        ["oauth:refresh", value.subject, refreshToken],
-        refreshValue,
-        value.ttl.refresh,
-      )
+    if (!refreshToken) {
+      refreshToken = newRefreshToken()
+      await security.execute("createSession", {
+        grant: value,
+        familyID: parseRefreshToken(refreshToken)!.familyID,
+        refreshHash: await hashSecret(refreshToken),
+      })
     }
-    const accessTimeUsed = Math.floor((value.timeUsed ?? Date.now()) / 1000)
+    // header 和签名使用同一份密钥快照，避免轮换刚好发生在两次读取之间。
+    const key = await signingKey()
+    const accessTimeUsed = Math.floor(timeUsed / 1000)
     return {
       access: await new SignJWT({
-        mode: "access",
-        type: value.type,
-        properties: value.properties,
-        aud: value.clientID,
-        iss: issuer(ctx),
-        sub: value.subject,
+        mode: "access", type: value.type, properties: value.properties,
+        aud: value.clientID, iss: issuer(ctx), sub: value.subject,
       })
-        .setExpirationTime(Math.floor(accessTimeUsed + value.ttl.access))
-        .setProtectedHeader(
-          await signingKey().then((k) => ({
-            alg: k.alg,
-            kid: k.id,
-            typ: "JWT",
-          })),
-        )
-        .sign(await signingKey().then((item) => item.private)),
-      expiresIn: Math.floor(
-        accessTimeUsed + value.ttl.access - Date.now() / 1000,
-      ),
-      refresh: [value.subject, refreshToken].join(":"),
+        .setExpirationTime(accessTimeUsed + value.ttl.access)
+        .setProtectedHeader({ alg: key.alg, kid: key.id, typ: "JWT" })
+        .sign(key.private),
+      expiresIn: Math.max(0, Math.floor(accessTimeUsed + value.ttl.access - Date.now() / 1000)),
+      refresh: refreshToken,
     }
   }
 
   async function decrypt(value: string) {
-    return JSON.parse(
-      new TextDecoder().decode(
-        await compactDecrypt(
-          value,
-          await encryptionKey().then((v) => v.private),
-        ).then((value) => value.plaintext),
-      ),
-    )
+    const header = decodeProtectedHeader(value)
+    if (typeof header.kid !== "string" || header.alg !== "RSA-OAEP-512" ||
+        header.enc !== "A256GCM") throw new UnknownStateError()
+    let keys = await allEncryption()
+    let key = keys.find((item) => item.id === header.kid)
+    if (!key) {
+      keys = await allEncryption(true)
+      key = keys.find((item) => item.id === header.kid)
+    }
+    if (!key) throw new UnknownStateError()
+    const decrypted = await compactDecrypt(value, key.private, {
+      keyManagementAlgorithms: ["RSA-OAEP-512"],
+      contentEncryptionAlgorithms: ["A256GCM"],
+    })
+    return JSON.parse(new TextDecoder().decode(decrypted.plaintext))
   }
 
   function issuer(ctx: Context) {
@@ -720,6 +707,15 @@ export function issuer<
   app.use(async (c, next) => {
     if (configuredIssuer) c.set("openauthIssuer", configuredIssuer)
     await next()
+    c.header("X-Content-Type-Options", "nosniff")
+    if (c.res.headers.get("Content-Type")?.startsWith("text/html")) {
+      if (!c.res.headers.has("Content-Security-Policy")) {
+        c.header("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'")
+      }
+      if (!c.res.headers.has("X-Frame-Options")) c.header("X-Frame-Options", "DENY")
+      c.header("Referrer-Policy", "no-referrer")
+      c.header("Cache-Control", "no-store")
+    }
   })
   app.use("/token", async (c, next) => {
     c.header("Cache-Control", "no-store")
@@ -751,14 +747,9 @@ export function issuer<
     }),
     async (c) => {
       const all = await allSigning()
+      c.header("Cache-Control", "no-store")
       return c.json({
-        keys: all.map((item) => ({
-          ...item.jwk,
-          alg: item.alg,
-          exp: item.expired
-            ? Math.floor(item.expired.getTime() / 1000)
-            : undefined,
-        })),
+        keys: all.map((item) => ({ ...item.jwk, alg: item.alg })),
       })
     },
   )
@@ -773,6 +764,7 @@ export function issuer<
     }),
     async (c) => {
       const iss = issuer(c)
+      c.header("Cache-Control", "no-store")
       return c.json({
         issuer: iss,
         authorization_endpoint: `${iss}/authorize`,
@@ -780,6 +772,7 @@ export function issuer<
         jwks_uri: `${iss}/.well-known/jwks.json`,
         response_types_supported: ["code"],
         code_challenge_methods_supported: ["S256"],
+        token_endpoint_auth_methods_supported: ["none", "client_secret_basic", "client_secret_post"],
       })
     },
   )
@@ -802,146 +795,70 @@ export function issuer<
       }
       const grantType = form.get("grant_type")
 
-      if (grantType === "authorization_code") {
-        const code = form.get("code")
-        if (!code)
-          return c.json(
-            {
-              error: "invalid_request",
-              error_description: "Missing code",
-            },
-            400,
-          )
-        const key = ["oauth:code", code.toString()]
-        const payload = await Storage.get<{
-          type: string
-          properties: any
-          clientID: string
-          redirectURI: string
-          subject: string
-          ttl: {
-            access: number
-            refresh: number
-          }
-          pkce?: AuthorizationState["pkce"]
-          expiresAt: number
-        }>(storage, key)
-        if (!payload || !Number.isSafeInteger(payload.expiresAt) || payload.expiresAt <= Date.now()) {
-          return c.json(
-            {
-              error: "invalid_grant",
-              error_description: "Authorization code has been used or expired",
-            },
-            400,
-          )
+      let authenticatedClient: string | undefined
+      if (grantType === "authorization_code" || grantType === "refresh_token") {
+        if (!form.get("client_id") && !c.req.header("Authorization")) {
+          return c.json({ error: "invalid_request", error_description: "Missing client_id" }, 400)
         }
-        if (payload.redirectURI !== form.get("redirect_uri")) {
-          return c.json(
-            {
-              error: "invalid_redirect_uri",
-              error_description: "Redirect URI mismatch",
-            },
-            400,
-          )
+        authenticatedClient = await authenticateClient(c.req.raw, form)
+        if (!authenticatedClient) {
+          c.header("WWW-Authenticate", 'Basic realm="openauth"')
+          return c.json({ error: "invalid_client" }, 401)
         }
-        if (payload.clientID !== form.get("client_id")) {
-          return c.json(
-            {
-              error: "unauthorized_client",
-              error_description:
-                "Client is not authorized to use this authorization code",
-            },
-            403,
-          )
-        }
+      }
 
-        const codeVerifier = form.get("code_verifier")?.toString()
-        if (
-          !payload.pkce || !codeVerifier ||
-          !(await validatePKCE(codeVerifier, payload.pkce.challenge, payload.pkce.method))
-        ) {
-          return c.json({ error: "invalid_grant", error_description: "Invalid PKCE proof" }, 400)
+      if (grantType === "authorization_code") {
+        const code = form.get("code")?.toString()
+        const redirectURI = form.get("redirect_uri")?.toString()
+        const verifier = form.get("code_verifier")?.toString()
+        if (!code || !redirectURI || !isPKCEVerifier(verifier)) {
+          return c.json({ error: "invalid_grant" }, 400)
         }
-        // TODO: replace get/remove with atomic consume on a transactional store.
-        const tokens = await generateTokens(c, payload)
-        await Storage.remove(storage, key)
+        const refresh = newRefreshToken()
+        const grant = await security.execute("redeemCode", {
+          codeHash: await hashSecret(code),
+          clientID: authenticatedClient!,
+          redirectURI,
+          challenge: await hashSecret(verifier),
+          familyID: parseRefreshToken(refresh)!.familyID,
+          refreshHash: await hashSecret(refresh),
+        })
+        if (!grant) return c.json({ error: "invalid_grant" }, 400)
+        const tokens = await generateTokens(c, grant, refresh)
         return c.json({
-          access_token: tokens.access,
-          token_type: "Bearer",
-          expires_in: tokens.expiresIn,
-          refresh_token: tokens.refresh,
+          access_token: tokens.access, token_type: "Bearer",
+          expires_in: tokens.expiresIn, refresh_token: tokens.refresh,
         })
       }
 
       if (grantType === "refresh_token") {
-        const refreshToken = form.get("refresh_token")
-        if (!refreshToken)
-          return c.json(
-            {
-              error: "invalid_request",
-              error_description: "Missing refresh_token",
-            },
-            400,
-          )
-        const splits = refreshToken.toString().split(":")
-        const token = splits.pop()!
-        const subject = splits.join(":")
-        const key = ["oauth:refresh", subject, token]
-        const payload = await Storage.get<{
-          type: string
-          properties: any
-          clientID: string
-          subject: string
-          ttl: {
-            access: number
-            refresh: number
-          }
-          nextToken: string
-          timeUsed?: number
-        }>(storage, key)
-        if (!payload) {
-          return c.json(
-            {
-              error: "invalid_grant",
-              error_description: "Refresh token has been used or expired",
-            },
-            400,
-          )
-        }
-        if (form.get("client_id") !== payload.clientID) {
-          return c.json({ error: "invalid_grant", error_description: "Client mismatch" }, 400)
-        }
-        const generateRefreshToken = !payload.timeUsed
-        if (ttlRefreshReuse <= 0) {
-          // no reuse interval, remove the refresh token immediately
-          await Storage.remove(storage, key)
-        } else if (!payload.timeUsed) {
-          payload.timeUsed = Date.now()
-          await Storage.set(
-            storage,
-            key,
-            payload,
-            ttlRefreshReuse + ttlRefreshRetention,
-          )
-        } else if (Date.now() > payload.timeUsed + ttlRefreshReuse * 1000) {
-          // token was reused past the allowed interval
-          await auth.invalidate(subject)
-          return c.json(
-            {
-              error: "invalid_grant",
-              error_description: "Refresh token has been used or expired",
-            },
-            400,
-          )
-        }
-        const tokens = await generateTokens(c, payload, {
-          generateRefreshToken,
+        const raw = form.get("refresh_token")
+        if (!raw) return c.json({ error: "invalid_request" }, 400)
+        const presented = parseRefreshToken(raw)
+        // 旧会话不从 KV 导入；切换后重新登录，不能把旧的重放缺陷带入新存储。
+        if (!presented) return c.json({ error: "invalid_grant" }, 400)
+        const successor = newRefreshToken(presented.familyID)
+        const rotated = await security.execute("rotate", {
+          familyID: presented.familyID,
+          tokenHash: await hashSecret(presented.token),
+          clientID: authenticatedClient!,
+          successorHash: await hashSecret(successor),
+          successorCiphertext: await encrypt({
+            purpose: "refresh-successor", familyID: presented.familyID, token: successor,
+          }),
+          reuse: ttlRefreshReuse,
         })
+        if (!rotated) return c.json({ error: "invalid_grant" }, 400)
+        const stored = await decrypt(rotated.tokenCiphertext)
+        if (stored.purpose !== "refresh-successor" ||
+            stored.familyID !== presented.familyID ||
+            parseRefreshToken(stored.token)?.familyID !== presented.familyID) {
+          throw new Error("Invalid refresh successor")
+        }
+        const tokens = await generateTokens(c, rotated.grant, stored.token, rotated.timeUsed)
         return c.json({
-          access_token: tokens.access,
-          token_type: "Bearer",
-          refresh_token: tokens.refresh,
-          expires_in: tokens.expiresIn,
+          access_token: tokens.access, token_type: "Bearer",
+          refresh_token: tokens.refresh, expires_in: tokens.expiresIn,
         })
       }
 
@@ -1099,9 +1016,26 @@ export function issuer<
       mode: "access"
       type: keyof SubjectSchema
       properties: v1.InferInput<SubjectSchema[keyof SubjectSchema]>
-    }>(token, () => signingKey().then((item) => item.public), {
+    }>(token, async (header) => {
+      let keys = await allSigning()
+      let key = keys.find((item) => item.id === header.kid && item.alg === header.alg)
+      if (!key) {
+        keys = await allSigning(true)
+        key = keys.find((item) => item.id === header.kid && item.alg === header.alg)
+      }
+      if (!key) throw new Error("Unknown signing key")
+      return key.public
+    }, {
       issuer: issuer(c),
+      algorithms: ["ES256", "RS512"],
+      requiredClaims: ["iss", "aud", "exp", "sub"],
     })
+    if (result.payload.mode !== "access" ||
+        typeof result.payload.type !== "string" ||
+        !Object.hasOwn(input.subjects, result.payload.type)) {
+      c.header("WWW-Authenticate", 'Bearer error="invalid_token"')
+      return c.json({ error: "invalid_token" }, 401)
+    }
 
     const validated = await input.subjects[result.payload.type][
       "~standard"
@@ -1114,7 +1048,7 @@ export function issuer<
     return c.json({
       error: "invalid_token",
       error_description: "Invalid token",
-    })
+    }, 401)
   })
 
   app.onError(async (err, c) => {

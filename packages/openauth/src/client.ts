@@ -54,6 +54,8 @@ import {
   InvalidSubjectError,
 } from "./error.js"
 import { generatePKCE } from "./pkce.js"
+import { issuerOrigin } from "./security.js"
+import { basicCredentials, expiringCache } from "./security-utils.js"
 
 /**
  * The well-known information for an OAuth 2.0 authorization server.
@@ -130,6 +132,8 @@ export interface ClientInput {
    * ```
    */
   clientID: string
+  /** 只用于服务端机密客户端；不得传入 SPA 或任何浏览器构建产物。 */
+  clientSecret?: string
   /**
    * The URL of your OpenAuth server.
    *
@@ -542,33 +546,29 @@ export interface Client {
  * @param input - Configure the client.
  */
 export function createClient(input: ClientInput): Client {
-  const jwksCache = new Map<string, ReturnType<typeof createLocalJWKSet>>()
-  const issuerCache = new Map<string, WellKnown>()
-  const issuer = input.issuer || process.env.OPENAUTH_ISSUER
-  if (!issuer) throw new Error("No issuer")
+  const configuredIssuer = input.issuer || process.env.OPENAUTH_ISSUER
+  if (!configuredIssuer) throw new Error("No issuer")
+  const issuer = issuerOrigin(configuredIssuer)
   const f = input.fetch ?? fetch
+  const authorization = input.clientSecret === undefined ? undefined :
+    basicCredentials(input.clientID, input.clientSecret)
 
-  async function getIssuer() {
-    const cached = issuerCache.get(issuer!)
-    if (cached) return cached
-    const wellKnown = (await (f || fetch)(
-      `${issuer}/.well-known/oauth-authorization-server`,
-    ).then((r) => r.json())) as WellKnown
-    issuerCache.set(issuer!, wellKnown)
-    return wellKnown
-  }
+  const getIssuer = expiringCache(async () => {
+    const response = await f(`${issuer}/.well-known/oauth-authorization-server`)
+    if (!response.ok) throw new Error("Issuer discovery failed")
+    const value = await response.json() as WellKnown & { issuer?: string }
+    if ((value.issuer !== undefined && value.issuer !== issuer) ||
+        typeof value.jwks_uri !== "string" ||
+        new URL(value.jwks_uri).origin !== issuer) throw new Error("Invalid issuer metadata")
+    return value
+  })
 
-  async function getJWKS() {
-    const wk = await getIssuer()
-    const cached = jwksCache.get(issuer!)
-    if (cached) return cached
-    const keyset = (await (f || fetch)(wk.jwks_uri).then((r) =>
-      r.json(),
-    )) as JSONWebKeySet
-    const result = createLocalJWKSet(keyset)
-    jwksCache.set(issuer!, result)
-    return result
-  }
+  const getJWKS = expiringCache(async () => {
+    const metadata = await getIssuer()
+    const response = await f(metadata.jwks_uri)
+    if (!response.ok) throw new Error("JWKS request failed")
+    return createLocalJWKSet(await response.json() as JSONWebKeySet)
+  })
 
   const result = {
     async authorize(
@@ -628,6 +628,7 @@ export function createClient(input: ClientInput): Client {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
+          ...(authorization ? { Authorization: authorization } : {}),
         },
         body: new URLSearchParams({
           code,
@@ -675,6 +676,7 @@ export function createClient(input: ClientInput): Client {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
+          ...(authorization ? { Authorization: authorization } : {}),
         },
         body: new URLSearchParams({
           grant_type: "refresh_token",
@@ -703,17 +705,24 @@ export function createClient(input: ClientInput): Client {
       options?: VerifyOptions,
     ): Promise<VerifyResult<T> | VerifyError> {
       try {
-        const jwks = await getJWKS()
-        const result = await jwtVerify<{
+        const check = async (reload = false) => jwtVerify<{
           mode: "access"
           type: keyof T
           properties: v1.InferInput<T[keyof T]>
-        }>(token, jwks, {
+        }>(token, await getJWKS(reload), {
           issuer,
           audience: options?.audience ?? input.clientID,
           algorithms: ["ES256", "RS512"],
           requiredClaims: ["iss", "aud", "exp", "sub"],
         })
+        let result: Awaited<ReturnType<typeof check>>
+        try {
+          result = await check()
+        } catch (error) {
+          if (!(error instanceof errors.JWKSNoMatchingKey)) throw error
+          // 只对未知 kid 重取一次；错误签名或错误 claims 不能触发无限网络重试。
+          result = await check(true)
+        }
         if (
           result.payload.mode !== "access" ||
           typeof result.payload.sub !== "string" || !result.payload.sub ||

@@ -1,51 +1,49 @@
 /**
- * Configure OpenAuth to use [Cloudflare KV](https://developers.cloudflare.com/kv/) as a
- * storage adapter.
- *
- * ```ts
- * import { CloudflareStorage } from "@openauthjs/openauth/storage/cloudflare"
- *
- * const storage = CloudflareStorage({
- *   namespace: "my-namespace"
- * })
- *
- *
- * export default issuer({
- *   storage,
- *   // ...
- * })
- * ```
- *
- * @packageDocumentation
+ * Cloudflare KV 仅保存普通记录，不承担授权码消费或刷新轮换的事务。
+ * 安全关键状态请同时配置 DurableObjectSecurityStorage。
  */
 import type { KVNamespace } from "@cloudflare/workers-types"
 import { joinKey, splitKey, StorageAdapter } from "./storage.js"
 
-/**
- * Configure the Cloudflare KV store that's created.
- */
 export interface CloudflareStorageOptions {
   namespace: KVNamespace
 }
-/**
- * Creates a Cloudflare KV store.
- * @param options - The config for the adapter.
- */
+
+interface StoredValue {
+  __openauth_storage: 2
+  value: any
+  expiresAt: number | null
+}
+
+function decode(value: any) {
+  if (value?.__openauth_storage !== 2) return value
+  if (value.expiresAt !== null &&
+      (!Number.isSafeInteger(value.expiresAt) || value.expiresAt <= Date.now())) return
+  return value.value
+}
+
 export function CloudflareStorage(
   options: CloudflareStorageOptions,
 ): StorageAdapter {
   return {
     async get(key: string[]) {
       const value = await options.namespace.get(joinKey(key), "json")
-      if (!value) return
-      return value as Record<string, any>
+      if (value === null) return
+      return decode(value)
     },
 
     async set(key: string[], value: any, expiry?: Date) {
-      await options.namespace.put(joinKey(key), JSON.stringify(value), {
-        expirationTtl: expiry
-          ? Math.max(Math.floor((expiry.getTime() - Date.now()) / 1000), 60)
-          : undefined,
+      const expiresAt = expiry?.getTime() ?? null
+      if (expiresAt !== null && !Number.isSafeInteger(expiresAt)) throw new Error("Invalid expiry")
+      if (expiresAt !== null && expiresAt <= Date.now()) {
+        await options.namespace.delete(joinKey(key))
+        return
+      }
+      const stored: StoredValue = { __openauth_storage: 2, value, expiresAt }
+      await options.namespace.put(joinKey(key), JSON.stringify(stored), {
+        // KV 的物理清理下限为 60 秒；get 和 scan 独立执行应用层截止时间。
+        expirationTtl: expiresAt === null ? undefined :
+          Math.max(Math.ceil((expiresAt - Date.now()) / 1000), 60),
       })
     },
 
@@ -60,16 +58,13 @@ export function CloudflareStorage(
           prefix: joinKey([...prefix, ""]),
           cursor,
         })
-
         for (const key of result.keys) {
-          const value = await options.namespace.get(key.name, "json")
-          if (value !== null) {
-            yield [splitKey(key.name), value]
-          }
+          const raw = await options.namespace.get(key.name, "json")
+          if (raw === null) continue
+          const value = decode(raw)
+          if (value !== undefined) yield [splitKey(key.name), value]
         }
-        if (result.list_complete) {
-          break
-        }
+        if (result.list_complete) break
         cursor = result.cursor
       }
     },

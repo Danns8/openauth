@@ -30,6 +30,7 @@
  */
 import { joinKey, splitKey, StorageAdapter } from "./storage.js"
 import { existsSync, readFileSync } from "node:fs"
+import { MemorySecurityStorage } from "./security.js"
 import { writeFile } from "node:fs/promises"
 
 /**
@@ -85,6 +86,8 @@ export function MemoryStorage(input?: MemoryStorageOptions): StorageAdapter {
     return { found: false, index: left }
   }
   return {
+    // 认证状态不随 persist 文件恢复；开发服务器重启后需要重新登录。
+    security: MemorySecurityStorage(),
     async get(key: string[]) {
       const match = search(joinKey(key))
       if (!match.found) return undefined

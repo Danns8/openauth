@@ -1,5 +1,6 @@
 import type { Context, Hono } from "hono"
 import { StorageAdapter } from "../storage/storage.js"
+import type { CredentialProof, SecurityStorage } from "../storage/security.js"
 
 export type ProviderRoute = Hono
 
@@ -20,6 +21,8 @@ export interface ProviderOptions<Properties> {
     properties: Properties,
     opts?: {
       invalidate?: (subject: string) => Promise<void>
+      /** 签发前重新检查密码版本，阻止改密前已经开始的登录继续创建会话。 */
+      credential?: CredentialProof
     },
   ) => Promise<Response>
   forward: (ctx: Context, response: Response) => Response
@@ -28,6 +31,7 @@ export interface ProviderOptions<Properties> {
   unset: (ctx: Context, key: string) => Promise<void>
   invalidate: (subject: string) => Promise<void>
   storage: StorageAdapter
+  security: SecurityStorage
 }
 export class ProviderError extends Error {}
 export class ProviderUnknownError extends ProviderError {}
