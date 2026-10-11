@@ -30,6 +30,8 @@
 
 ## 快速开始
 
+部署本仓库到 Cloudflare Workers，并通过 GitHub 自动构建，请参见 [Cloudflare 部署说明](cloudflare/README.md)。
+
 如果你只想尽快上手，可以直接进入[代码示例](https://github.com/toolbeam/openauth/tree/master/examples)文件夹复制粘贴。还有 [SST 组件](https://sst.dev/docs/component/aws/auth) 可用于部署 OpenAuth 所需的一切。
 
 ## 理念

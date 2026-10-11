@@ -8,13 +8,18 @@
     "examples/client/*"
   ],
   "scripts": {
+    "worker:build": "wrangler deploy --dry-run --outdir dist/worker",
+    "worker:deploy": "wrangler deploy",
+    "worker:dev": "wrangler dev",
     "release": "bun run --filter=\"@openauthjs/openauth\" build && changeset publish"
   },
   "devDependencies": {
+    "wrangler": "4.149.0",
     "@tsconfig/node22": "22.0.0",
     "@types/bun": "latest"
   },
   "dependencies": {
+    "valibot": "1.0.0-beta.15",
     "@changesets/cli": "2.27.10",
     "prettier": "3.4.2",
     "typescript": "5.6.3"

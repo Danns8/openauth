@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openauth",
+  "main": "cloudflare/worker.ts",
+  "tsconfig": "cloudflare/tsconfig.json",
+  "account_id": "bbc5e29fe806dd145d9876a8259ccffc",
+  "compatibility_date": "2026-10-11",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "keep_vars": true,
+  "kv_namespaces": [
+    { "binding": "AUTH_KV", "id": "36db49d24351455ab1d4f11668377c43" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "AUTH_SECURITY", "class_name": "OpenAuthSecurity" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["OpenAuthSecurity"] }
+  ]
+}
