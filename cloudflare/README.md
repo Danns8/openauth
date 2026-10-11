@@ -5,6 +5,7 @@
 ## 当前状态
 
 - Worker 名称：`openauth`，使用默认 `workers.dev` 域名。
+- 服务地址：<https://openauth.danns.workers.dev>。
 - 普通记录：`AUTH_KV`。
 - 安全事务、签名密钥、授权码及刷新令牌状态：SQLite Durable Object `AUTH_SECURITY`。
 - 尚未配置登录提供商和客户端，授权请求默认被拒绝。
@@ -22,6 +23,8 @@ bun run worker:deploy
 首次部署需要 Cloudflare 授权；`wrangler.jsonc` 已绑定当前账号及创建的 KV。保留 Durable Object 名称和迁移历史，避免切换已有认证状态。
 
 ## GitHub 自动构建
+
+当前 Worker 已连接 `Danns8/openauth` 的 `master` 分支，使用专用的 `openauth token`。提交推送会触发 Cloudflare Workers Builds。
 
 在 Cloudflare 控制台选择 **Workers & Pages → openauth → Settings → Builds → Connect**，连接 GitHub 仓库 `Danns8/openauth`。
 
